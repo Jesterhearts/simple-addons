@@ -11,4 +11,7 @@ rfd       = "0.17.2"
 serde     = { version = "1.0.229", features = ["derive"] }
 tempfile  = "3.27.0"
 thiserror = "2.0.21"
+# Only to name the windowing backend eframe opens on; see src/gui/backend.rs.
+# The version has to be the one eframe itself uses, or the hook will not fit.
+winit     = "0.30"
 zip       = "9.0.0"

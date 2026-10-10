@@ -21,6 +21,19 @@ line is an instruction for that run and wins over what was remembered. If the
 folder or version is gone by the next run, the choice is dropped rather than
 restored.
 
+### Drag and drop and Wayland
+
+The window opens on X11 whenever an X display is there to open on, including
+the XWayland that a Wayland session normally runs. This is not a preference:
+the Wayland backend the window is built on reports no dropped files at all,
+so a window opened on Wayland can never see a drop.
+
+`SIMPLE_ADDONS_BACKEND=wayland` asks for a native Wayland window instead, at
+the cost of drag and drop. The drop area says so and points at the buttons
+when that is where the window ended up, which is also what happens on a
+Wayland session with no XWayland. `SIMPLE_ADDONS_BACKEND=x11` asks for X11
+explicitly; any other value is ignored.
+
 ## The command line
 
 ```

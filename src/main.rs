@@ -28,8 +28,11 @@ fn open_window(args: &Args) -> ExitCode {
         args.sources.clone(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("simple-addons: cannot open the window: {error}");
+        Err(failed) => {
+            eprintln!("simple-addons: cannot open the window: {}", failed.error);
+            if let Some(advice) = failed.advice {
+                eprintln!("simple-addons: {advice}");
+            }
             ExitCode::FAILURE
         }
     }

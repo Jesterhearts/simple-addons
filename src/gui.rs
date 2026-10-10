@@ -8,6 +8,7 @@
 //! place that changes anything. Installing runs on another thread so that a
 //! large archive cannot freeze the window.
 
+mod backend;
 mod settings;
 
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use eframe::egui;
 
 use crate::discovery::{self, Flavor, WowInstall};
 use crate::install::Outcome;
+use backend::Backend;
 use settings::Settings;
 
 const WINDOW_TITLE: &str = "Simple Addons";
@@ -26,38 +28,64 @@ const WINDOW_TITLE: &str = "Simple Addons";
 /// tell which window belongs to which icon.
 const APP_ID: &str = "simple-addons";
 
+/// A window that would not open, and what to try about it.
+///
+/// There is no window to report this in, so the caller has to put it on the
+/// terminal. The advice is separate from the error because it is about the
+/// choice this program made, not about what winit then ran into.
+#[derive(Debug)]
+pub struct WindowFailed {
+    pub error: eframe::Error,
+    pub advice: Option<&'static str>,
+}
+
 /// Opens the window and runs until it is closed.
 ///
 /// `wow_dir` and `flavor` come from the command line and only set the
 /// starting choice; the user can change both in the window. Any `sources`
 /// are installed as soon as the window opens, which is what happens when
 /// files are dropped on a launcher icon.
-pub fn run(wow_dir: Option<&Path>, flavor: Option<&str>, sources: Vec<PathBuf>) -> eframe::Result {
+pub fn run(
+    wow_dir: Option<&Path>,
+    flavor: Option<&str>,
+    sources: Vec<PathBuf>,
+) -> Result<(), WindowFailed> {
     let wow_dir = wow_dir.map(Path::to_path_buf);
     let flavor = flavor.map(str::to_string);
-    let options = eframe::NativeOptions {
+    let chosen = backend::choose(&backend::read_session());
+    let drops_arrive = backend::reports_drops(chosen);
+    // The window is built inside the closure because the choices stored by
+    // the last run only become readable once eframe has opened its storage.
+    eframe::run_native(
+        WINDOW_TITLE,
+        window_options(chosen),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(
+                wow_dir.as_deref(),
+                flavor.as_deref(),
+                sources,
+                drops_arrive,
+                cc.storage,
+            )))
+        }),
+    )
+    .map_err(|error| WindowFailed {
+        error,
+        advice: backend::advice(chosen),
+    })
+}
+
+fn window_options(chosen: Backend) -> eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
             .with_app_id(APP_ID)
             .with_inner_size([760.0, 560.0])
             .with_min_inner_size([520.0, 380.0])
             .with_drag_and_drop(true),
+        event_loop_builder: backend::force(chosen),
         ..Default::default()
-    };
-    // The window is built inside the closure because the choices stored by
-    // the last run only become readable once eframe has opened its storage.
-    eframe::run_native(
-        WINDOW_TITLE,
-        options,
-        Box::new(move |cc| {
-            Ok(Box::new(App::new(
-                wow_dir.as_deref(),
-                flavor.as_deref(),
-                sources,
-                cc.storage,
-            )))
-        }),
-    )
+    }
 }
 
 /// Where addons will go.
@@ -107,6 +135,10 @@ struct App {
     /// A message about the game folder, such as a path that turned out not to
     /// be one.
     notice: Option<String>,
+    /// Whether dropped files reach this window at all, which depends on the
+    /// backend it opened on. False means the drop zone has to send the user
+    /// to the buttons instead of inviting a drop that will never land.
+    drops_arrive: bool,
     /// The choices stored by the last run, kept so that a run which never had
     /// a target to choose does not wipe them.
     remembered: Settings,
@@ -126,6 +158,7 @@ impl App {
         wow_dir: Option<&Path>,
         flavor: Option<&str>,
         sources: Vec<PathBuf>,
+        drops_arrive: bool,
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let remembered = settings::load(storage);
@@ -139,6 +172,7 @@ impl App {
             queued: sources,
             rows: Vec::new(),
             notice,
+            drops_arrive,
             remembered,
         }
     }
@@ -585,7 +619,7 @@ fn summarise(rows: &[Row]) -> String {
 /// The rest of the window: the area files are dropped onto.
 fn drop_panel(ui: &mut egui::Ui, app: &App) -> Vec<Action> {
     let hovering = hovering_count(ui.ctx());
-    let (heading, hint) = zone_text(&app.job, app.target.as_ref(), hovering);
+    let (heading, hint) = zone_text(&app.job, app.target.as_ref(), hovering, app.drops_arrive);
     let busy = matches!(app.job, Job::Working { .. });
     egui::CentralPanel::default()
         .show(ui, |ui| {
@@ -657,7 +691,15 @@ fn browse_buttons(ui: &mut egui::Ui) -> Vec<Action> {
 
 /// The heading and the hint shown in the drop zone, which together say what
 /// will happen if something is dropped.
-fn zone_text(job: &Job, target: Option<&Target>, hovering: usize) -> (String, String) {
+///
+/// `drops_arrive` is false on a backend that never reports a drop, and there
+/// the zone stops asking to be dropped on and names the buttons instead.
+fn zone_text(
+    job: &Job,
+    target: Option<&Target>,
+    hovering: usize,
+    drops_arrive: bool,
+) -> (String, String) {
     if let Job::Working { items, .. } = job {
         return (
             format!("Installing {}...", describe_items(*items)),
@@ -676,9 +718,19 @@ fn zone_text(job: &Job, target: Option<&Target>, hovering: usize) -> (String, St
             format!("Release to install into {}.", target.flavor.label()),
         );
     }
+    let destination = display_path(&target.addons_dir());
+    if !drops_arrive {
+        return (
+            "Choose addon folders or zip files".to_string(),
+            format!(
+                "This window cannot take drops on Wayland. The buttons below \
+                 install into {destination}"
+            ),
+        );
+    }
     (
         "Drop addon folders or zip files here".to_string(),
-        format!("They go into {}", display_path(&target.addons_dir())),
+        format!("They go into {destination}"),
     )
 }
 
@@ -820,7 +872,7 @@ mod tests {
 
     #[test]
     fn the_drop_zone_says_there_is_nowhere_to_install_to() {
-        let (heading, hint) = zone_text(&Job::Idle, None, 0);
+        let (heading, hint) = zone_text(&Job::Idle, None, 0, true);
 
         assert_eq!(heading, "No World of Warcraft folder found");
         assert!(hint.contains("Choose"));
@@ -828,10 +880,41 @@ mod tests {
 
     #[test]
     fn the_drop_zone_counts_what_is_being_dragged() {
-        let (heading, _) = zone_text(&Job::Idle, None, 3);
+        let (heading, _) = zone_text(&Job::Idle, None, 3, true);
 
         // With nowhere to install to, the count is not the point.
         assert_eq!(heading, "No World of Warcraft folder found");
+    }
+
+    /// Builds a target to install into, so that the drop zone has somewhere to
+    /// name.
+    fn fake_target(root: &Path) -> Target {
+        let install = fake_install(root, &["_retail_"]);
+        let flavor = first_flavor(&install);
+        Target { install, flavor }
+    }
+
+    #[test]
+    fn the_drop_zone_invites_a_drop_where_drops_arrive() {
+        let root = tempfile::tempdir().unwrap();
+        let target = fake_target(root.path());
+
+        let (heading, hint) = zone_text(&Job::Idle, Some(&target), 0, true);
+
+        assert_eq!(heading, "Drop addon folders or zip files here");
+        assert!(hint.contains("AddOns"));
+    }
+
+    #[test]
+    fn the_drop_zone_sends_the_user_to_the_buttons_where_drops_never_arrive() {
+        let root = tempfile::tempdir().unwrap();
+        let target = fake_target(root.path());
+
+        let (heading, hint) = zone_text(&Job::Idle, Some(&target), 0, false);
+
+        assert_eq!(heading, "Choose addon folders or zip files");
+        assert!(hint.contains("The buttons below install into"));
+        assert!(hint.contains("AddOns"));
     }
 
     #[test]
