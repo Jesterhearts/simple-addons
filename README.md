@@ -108,3 +108,8 @@ cargo +nightly fmt
 
 The desktop entry and the icon are data, kept in `resources/` and installed
 by the script rather than written by it.
+
+## License
+
+This software is released into the public domain under the Unlicense. See
+[UNLICENSE](UNLICENSE) for the full text.
