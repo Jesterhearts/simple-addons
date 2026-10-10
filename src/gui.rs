@@ -22,16 +22,23 @@ use settings::Settings;
 
 const WINDOW_TITLE: &str = "Simple Addons";
 
+/// The name the desktop entry and the window agree on, so that a launcher can
+/// tell which window belongs to which icon.
+const APP_ID: &str = "simple-addons";
+
 /// Opens the window and runs until it is closed.
 ///
 /// `wow_dir` and `flavor` come from the command line and only set the
-/// starting choice; the user can change both in the window.
-pub fn run(wow_dir: Option<&Path>, flavor: Option<&str>) -> eframe::Result {
+/// starting choice; the user can change both in the window. Any `sources`
+/// are installed as soon as the window opens, which is what happens when
+/// files are dropped on a launcher icon.
+pub fn run(wow_dir: Option<&Path>, flavor: Option<&str>, sources: Vec<PathBuf>) -> eframe::Result {
     let wow_dir = wow_dir.map(Path::to_path_buf);
     let flavor = flavor.map(str::to_string);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
+            .with_app_id(APP_ID)
             .with_inner_size([760.0, 560.0])
             .with_min_inner_size([520.0, 380.0])
             .with_drag_and_drop(true),
@@ -46,6 +53,7 @@ pub fn run(wow_dir: Option<&Path>, flavor: Option<&str>) -> eframe::Result {
             Ok(Box::new(App::new(
                 wow_dir.as_deref(),
                 flavor.as_deref(),
+                sources,
                 cc.storage,
             )))
         }),
@@ -117,6 +125,7 @@ impl App {
     fn new(
         wow_dir: Option<&Path>,
         flavor: Option<&str>,
+        sources: Vec<PathBuf>,
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let remembered = settings::load(storage);
@@ -127,7 +136,7 @@ impl App {
             installs,
             target,
             job: Job::Idle,
-            queued: Vec::new(),
+            queued: sources,
             rows: Vec::new(),
             notice,
             remembered,

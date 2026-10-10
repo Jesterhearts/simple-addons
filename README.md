@@ -33,7 +33,7 @@ simple-addons [OPTIONS] <SOURCE>...
 | `-f`, `--flavor <NAME>` | Game version to install into, such as `retail` or `classic_era`. Defaults to retail. |
 | `-n`, `--dry-run` | Report what would be installed without writing anything. |
 | `--list` | List the World of Warcraft directories that were found, then stop. |
-| `--gui` | Open the window even when sources are given. |
+| `--gui` | Open the window even when sources are given. The window installs them as it opens. |
 
 ```console
 $ simple-addons --list
@@ -49,6 +49,22 @@ Installing to /home/you/Games/.../World of Warcraft (Retail)
 ```
 
 The exit status is non-zero if any addon failed, so this works in a script.
+
+## Starting it from the launcher
+
+```
+scripts/install-desktop-entry.sh
+```
+
+This runs `cargo install --path .` and writes a desktop entry naming the
+program cargo installed, so Simple Addons appears in the application
+launcher. The entry opens the window, and files dropped on its icon are
+installed as the window opens.
+
+The entry and its icon go under `~/.local` by default; `--prefix DIR` puts
+them somewhere else. `--no-install` writes only the entry, for when cargo
+install has already been run. `--uninstall` undoes the lot. Rerun the script
+after changing the code to install the new version.
 
 ## What it handles
 
@@ -89,3 +105,6 @@ cargo test
 cargo clippy --all-targets
 cargo +nightly fmt
 ```
+
+The desktop entry and the icon are data, kept in `resources/` and installed
+by the script rather than written by it.

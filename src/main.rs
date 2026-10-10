@@ -22,7 +22,11 @@ fn main() -> ExitCode {
 /// A window that will not open has to be reported on the terminal, since
 /// there is no window to report it in.
 fn open_window(args: &Args) -> ExitCode {
-    match gui::run(args.wow_dir.as_deref(), args.flavor.as_deref()) {
+    match gui::run(
+        args.wow_dir.as_deref(),
+        args.flavor.as_deref(),
+        args.sources.clone(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("simple-addons: cannot open the window: {error}");

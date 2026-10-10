@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <title>Simple Addons</title>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1f2b3a"/>
+  <path d="M14 38v8a4 4 0 0 0 4 4h28a4 4 0 0 0 4-4v-8"
+        fill="none" stroke="#7fd1a0" stroke-width="4" stroke-linecap="round"/>
+  <path d="M32 13v23" fill="none" stroke="#eef3f8" stroke-width="4" stroke-linecap="round"/>
+  <path d="M22 26l10 10 10-10"
+        fill="none" stroke="#eef3f8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

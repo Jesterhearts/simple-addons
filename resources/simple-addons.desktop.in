@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Simple Addons
+GenericName=Addon Installer
+Comment=Install World of Warcraft addons from a folder or a zip file
+Exec=@BINARY@ --gui %F
+Icon=simple-addons
+Terminal=false
+Categories=Utility;
+Keywords=warcraft;wow;addon;install;
+StartupWMClass=simple-addons
+StartupNotify=true
