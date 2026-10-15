@@ -19,6 +19,9 @@ pub struct Toc {
     /// The game builds the addon declares support for, newest listed first by
     /// convention. An addon that works across game versions lists several.
     pub interface: Vec<u32>,
+    /// The addons that have to be installed for this one to load, by folder
+    /// name.
+    pub dependencies: Vec<String>,
 }
 
 /// Reads a toc file.
@@ -33,6 +36,9 @@ pub fn read(path: &Path) -> Toc {
 }
 
 pub fn parse(text: &str) -> Toc {
+    // Some editors start a file with a byte order mark, which would make the
+    // first line look like something other than a directive.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut toc = Toc::default();
     for (key, value) in directives(text) {
         match key.to_ascii_lowercase().as_str() {
@@ -41,6 +47,7 @@ pub fn parse(text: &str) -> Toc {
             "author" => toc.author = Some(strip_ui_escapes(value)),
             "notes" => toc.notes = Some(strip_ui_escapes(value)),
             "interface" => toc.interface = parse_interface(value),
+            key if names_dependencies(key) => toc.dependencies.extend(parse_addon_list(value)),
             _ => {}
         }
     }
@@ -62,6 +69,46 @@ fn parse_interface(value: &str) -> Vec<u32> {
         .split(',')
         .filter_map(|build| build.trim().parse().ok())
         .collect()
+}
+
+/// The game reads `## Dependencies`, `## RequiredDeps` and any directive whose
+/// name starts with `Dep` as the same list, and adds a repeated directive to
+/// it. `## OptionalDeps` names addons that are not required, so it is not
+/// part of the list. `key` is in lower case.
+fn names_dependencies(key: &str) -> bool {
+    key == "requireddeps" || key.starts_with("dep")
+}
+
+/// `## Dependencies: Details, WeakAuras` names two addons.
+///
+/// An inline directive such as `[AllowLoadGameType classic]` limits a line to
+/// some game versions. It is not a name, and it can hold commas of its own,
+/// so it is removed before the names are split. The dependency is kept for
+/// every game version: where these names lead to an addon being removed, it
+/// is named to the user first, so a name too many shows before anything
+/// happens, while a name too few would hide an addon that is about to break.
+fn parse_addon_list(value: &str) -> Vec<String> {
+    strip_inline_directives(value)
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Removes every `[...]` part of a directive value.
+fn strip_inline_directives(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for character in text.chars() {
+        match character {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => plain.push(character),
+            _ => {}
+        }
+    }
+    plain
 }
 
 /// Removes the game's inline markup so that a title reads as plain text.
@@ -131,6 +178,7 @@ mod tests {
                 author: Some("Someone".to_string()),
                 notes: Some("Does a thing.".to_string()),
                 interface: vec![110107, 110200],
+                dependencies: Vec::new(),
             }
         );
     }
@@ -172,6 +220,46 @@ mod tests {
     fn a_truncated_escape_does_not_lose_the_rest() {
         assert_eq!(strip_ui_escapes("Name|"), "Name");
         assert_eq!(strip_ui_escapes("|cff00"), "");
+    }
+
+    #[test]
+    fn reads_every_way_of_naming_a_required_dependency() {
+        let toc = parse(
+            "## Dependencies: WeakAuras, Details\n\
+             ## RequiredDeps: LibStub\n\
+             ## Dep: Ace3\n\
+             ## DEPS: Plater\n",
+        );
+
+        assert_eq!(
+            toc.dependencies,
+            vec!["WeakAuras", "Details", "LibStub", "Ace3", "Plater"]
+        );
+    }
+
+    #[test]
+    fn optional_dependencies_are_not_required() {
+        let toc = parse("## OptionalDeps: Masque, LibSharedMedia-3.0\n");
+
+        assert!(toc.dependencies.is_empty());
+    }
+
+    #[test]
+    fn inline_directives_are_not_dependency_names() {
+        let toc = parse(
+            "## Dependencies: Questie [AllowLoadGameType vanilla, tbc], Details\n\
+             ## Dependencies: , [ExcludeLoadGameType standard]\n",
+        );
+
+        assert_eq!(toc.dependencies, vec!["Questie", "Details"]);
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_directive() {
+        let toc = parse("\u{feff}## Dependencies: Foo\n## Title: Bar\n");
+
+        assert_eq!(toc.dependencies, vec!["Foo"]);
+        assert_eq!(toc.title, Some("Bar".to_string()));
     }
 
     #[test]

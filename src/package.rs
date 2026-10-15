@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 use crate::error::{Error, Result};
 
-pub use detect::AddonSource;
+pub use detect::{AddonName, AddonSource};
 pub use toc::Toc;
 
 /// Something to install, after checking that it exists and can be read.

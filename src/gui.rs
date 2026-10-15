@@ -1,25 +1,32 @@
-//! The window front end: drop a folder or a zip file onto it to install.
+//! The window front end: drop a folder or a zip file onto it to install, or
+//! tick addons in a list to remove them.
 //!
 //! This is user facing software, so nothing here stops the program. A failure
 //! becomes a line in the result list and the window carries on.
 //!
 //! The window state is plain data. Each frame reads it, draws from it, and
 //! returns the [`Action`] values the user asked for; [`apply`] is the one
-//! place that changes anything. Installing runs on another thread so that a
-//! large archive cannot freeze the window.
+//! place that changes anything. Installs and removals run on another thread
+//! so that a large archive cannot freeze the window.
 
+mod addon_list;
 mod backend;
+mod drop_zone;
+mod job;
+mod results;
 mod settings;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
 
 use eframe::egui;
 
 use crate::discovery::{self, Flavor, WowInstall};
-use crate::install::Outcome;
+use crate::installed::{self, InstalledAddon};
+use addon_list::{Confirmation, ListState};
 use backend::Backend;
+use job::{Job, Removal};
+use results::Row;
 use settings::Settings;
 
 const WINDOW_TITLE: &str = "Simple Addons";
@@ -101,35 +108,20 @@ impl Target {
     }
 }
 
-/// One line of the result list.
-#[derive(Debug, Clone)]
-struct Row {
-    status: &'static str,
-    addon: String,
-    detail: String,
-    failed: bool,
-}
-
-/// Whether an install is running. A job owns the channel its thread reports on.
-enum Job {
-    Idle,
-    Working {
-        items: usize,
-        results: Receiver<Vec<Row>>,
-    },
-}
-
 /// Everything the window holds.
 struct App {
     /// The game folders on offer in the picker.
     installs: Vec<WowInstall>,
     /// The chosen folder and game version, if there is one to choose.
     target: Option<Target>,
-    /// How many addons the target already has, as shown next to the picker.
-    installed: Option<usize>,
+    /// What the target already has, as the count next to the picker and the
+    /// Installed addons tab show it, or why its folder could not be read.
+    listing: Result<Vec<InstalledAddon>, String>,
     job: Job,
     /// Sources dropped while a job was running, installed once it ends.
     queued: Vec<PathBuf>,
+    /// A removal confirmed while a job was running, started once it ends.
+    queued_removal: Option<Removal>,
     /// Results so far, newest first.
     rows: Vec<Row>,
     /// A message about the game folder, such as a path that turned out not to
@@ -142,6 +134,18 @@ struct App {
     /// The choices stored by the last run, kept so that a run which never had
     /// a target to choose does not wipe them.
     remembered: Settings,
+    /// The tab the main area shows.
+    view: View,
+    /// The filter, the ticks and the dialog of the Installed addons tab.
+    list: ListState,
+}
+
+/// The tabs of the main area.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum View {
+    #[default]
+    Install,
+    Addons,
 }
 
 /// Something the user asked for while a frame was drawn.
@@ -151,6 +155,13 @@ enum Action {
     SelectFlavor(Flavor),
     ChooseInstallDir,
     ClearResults,
+    ShowView(View),
+    SetFilter(String),
+    Tick { addon: PathBuf, ticked: bool },
+    AskToRemove,
+    SetRemoveDependents(bool),
+    CancelRemoval,
+    ConfirmRemoval,
 }
 
 impl App {
@@ -163,17 +174,28 @@ impl App {
     ) -> Self {
         let remembered = settings::load(storage);
         let (installs, notice) = locate_installs(wow_dir, &remembered);
+        let (flavor, wow_dir_notice) = match flavor {
+            Some(requested) => (Some(requested), None),
+            None => match implied_flavor(wow_dir, &installs) {
+                Ok(implied) => (implied, None),
+                Err(error) => (None, Some(wow_dir_notice(&error))),
+            },
+        };
+        let notice = notice.or(wow_dir_notice);
         let target = initial_target(&installs, flavor, &remembered);
         Self {
-            installed: installed_count(target.as_ref()),
+            listing: read_listing(target.as_ref()),
             installs,
             target,
             job: Job::Idle,
             queued: sources,
+            queued_removal: None,
             rows: Vec::new(),
             notice,
             drops_arrive,
             remembered,
+            view: View::default(),
+            list: ListState::default(),
         }
     }
 }
@@ -189,21 +211,27 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if finish_job(&mut self.job, &mut self.rows) {
-            self.installed = installed_count(self.target.as_ref());
+        if job::finish(&mut self.job, &mut self.rows) {
+            refresh_listing(&mut self.listing, &mut self.list, self.target.as_ref());
         }
 
-        // Panels are added outermost first, and the central panel last.
-        let mut actions = dropped_sources(&ctx);
+        // Panels are added outermost first, and the central panel last. The
+        // dialog floats above them all.
+        let mut actions = drop_zone::dropped_sources(&ctx);
         actions.extend(target_panel(ui, self));
-        actions.extend(results_panel(ui, &self.rows));
-        actions.extend(drop_panel(ui, self));
+        actions.extend(results::results_panel(ui, &self.rows));
+        actions.extend(main_panel(ui, self));
+        actions.extend(addon_list::confirmation_dialog(
+            &ctx,
+            self.list.confirming.as_ref(),
+            job::is_busy(&self.job),
+        ));
         for action in actions {
             apply(action, self);
         }
 
         start_queued(self, &ctx);
-        if matches!(self.job, Job::Working { .. }) {
+        if job::is_busy(&self.job) {
             ctx.request_repaint();
         }
     }
@@ -243,6 +271,36 @@ fn offered_installs(remembered: &Settings) -> Vec<WowInstall> {
     installs
 }
 
+/// The game version a `--wow-dir` inside one names. The window starts on it
+/// when no `--flavor` was given, as the command line does.
+///
+/// For a path in no game version the window can see, the command line
+/// refuses. The window shows which game version it chose before anything is
+/// removed, so it opens on its usual choice instead, and says why.
+fn implied_flavor<'a>(
+    wow_dir: Option<&Path>,
+    installs: &'a [WowInstall],
+) -> crate::Result<Option<&'a str>> {
+    let (Some(dir), Some(install)) = (wow_dir, installs.first()) else {
+        return Ok(None);
+    };
+    Ok(discovery::flavor_containing(install, dir)?.map(Flavor::dir_name))
+}
+
+/// What the window says when the game version a `--wow-dir` lies in is not
+/// one it can see. The error's own words point at `--flavor`, which is how
+/// the command line chooses; in the window, the picker above is.
+fn wow_dir_notice(error: &crate::Error) -> String {
+    match error {
+        crate::Error::NotInGameVersion { path, .. } => format!(
+            "{} is not inside a game version found there, so the window chose one. \
+             Check the game version above.",
+            display_path(path)
+        ),
+        other => other.to_string(),
+    }
+}
+
 fn initial_target(
     installs: &[WowInstall],
     flavor: Option<&str>,
@@ -273,8 +331,36 @@ fn first_flavor(install: &WowInstall) -> Flavor {
     install.flavors()[0].clone()
 }
 
-fn installed_count(target: Option<&Target>) -> Option<usize> {
-    crate::count_installed(&target?.addons_dir())
+/// Lists what the target has installed.
+///
+/// A game version that has never had an addon has no folder for them, which
+/// means that nothing is installed rather than that something is wrong.
+fn read_listing(target: Option<&Target>) -> Result<Vec<InstalledAddon>, String> {
+    let Some(target) = target else {
+        return Ok(Vec::new());
+    };
+    let addons_dir = target.addons_dir();
+    if !addons_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    installed::list(&addons_dir).map_err(|error| error.to_string())
+}
+
+/// Reads the target's addons again. The ticks of any that are gone are
+/// dropped, and an open dialog is brought up to date.
+fn refresh_listing(
+    listing: &mut Result<Vec<InstalledAddon>, String>,
+    list: &mut ListState,
+    target: Option<&Target>,
+) {
+    *listing = read_listing(target);
+    match listing {
+        Ok(addons) => {
+            addon_list::keep_installed(&mut list.ticked, addons);
+            addon_list::refresh_confirmation(&mut list.confirming, addons);
+        }
+        Err(_) => addon_list::forget_choices(list),
+    }
 }
 
 fn apply(action: Action, app: &mut App) {
@@ -284,7 +370,69 @@ fn apply(action: Action, app: &mut App) {
         Action::SelectFlavor(flavor) => select_flavor(app, flavor),
         Action::ChooseInstallDir => choose_install_dir(app),
         Action::ClearResults => app.rows.clear(),
+        Action::ShowView(view) => {
+            app.view = view;
+            // Another program or a file manager can change the folder while
+            // the window is open, and the list is where that would show.
+            if view == View::Addons {
+                refresh_listing(&mut app.listing, &mut app.list, app.target.as_ref());
+            }
+        }
+        Action::SetFilter(filter) => app.list.filter = filter,
+        Action::Tick { addon, ticked } => tick(&mut app.list.ticked, addon, ticked),
+        Action::AskToRemove => {
+            app.list.confirming =
+                ask_to_remove(&app.listing, &app.list.ticked, app.target.as_ref());
+        }
+        Action::SetRemoveDependents(on) => {
+            if let Some(confirmation) = app.list.confirming.as_mut() {
+                confirmation.with_dependents = on;
+            }
+        }
+        Action::CancelRemoval => app.list.confirming = None,
+        Action::ConfirmRemoval => confirm_removal(
+            &mut app.list,
+            &mut app.queued_removal,
+            job::is_busy(&app.job),
+        ),
     }
+}
+
+fn tick(ticked: &mut BTreeSet<PathBuf>, addon: PathBuf, on: bool) {
+    if on {
+        ticked.insert(addon);
+    } else {
+        ticked.remove(&addon);
+    }
+}
+
+fn ask_to_remove(
+    listing: &Result<Vec<InstalledAddon>, String>,
+    ticked: &BTreeSet<PathBuf>,
+    target: Option<&Target>,
+) -> Option<Confirmation> {
+    let (Some(target), Ok(addons)) = (target, listing) else {
+        return None;
+    };
+    addon_list::confirmation(addons, ticked, target.addons_dir())
+}
+
+/// Hands a confirmed removal to the queue, which starts it this same frame,
+/// so that jobs only ever start in one place.
+///
+/// A removal confirmed while a job runs would be built from the list as it
+/// was before that job. The dialog's button waits for the job to finish, and
+/// this holds to that whatever sends the action: the dialog stays open, and
+/// is brought up to date when the job ends.
+fn confirm_removal(list: &mut ListState, queued_removal: &mut Option<Removal>, busy: bool) {
+    if busy {
+        return;
+    }
+    let Some(confirmation) = list.confirming.take() else {
+        return;
+    };
+    list.ticked.clear();
+    *queued_removal = Some(addon_list::removal(&confirmation));
 }
 
 fn select_install(app: &mut App, install: WowInstall) {
@@ -299,14 +447,16 @@ fn select_install(app: &mut App, install: WowInstall) {
         flavor: first_flavor(&install),
         install,
     });
-    app.installed = installed_count(app.target.as_ref());
+    addon_list::forget_choices(&mut app.list);
+    refresh_listing(&mut app.listing, &mut app.list, app.target.as_ref());
 }
 
 fn select_flavor(app: &mut App, flavor: Flavor) {
     if let Some(target) = app.target.as_mut() {
         target.flavor = flavor;
     }
-    app.installed = installed_count(app.target.as_ref());
+    addon_list::forget_choices(&mut app.list);
+    refresh_listing(&mut app.listing, &mut app.list, app.target.as_ref());
 }
 
 /// Asks for a game folder and takes it if it holds a game version.
@@ -323,144 +473,31 @@ fn choose_install_dir(app: &mut App) {
     }
 }
 
-/// Starts the next install when sources are waiting and nothing is running.
+/// Starts waiting work when nothing is running.
+///
+/// A confirmed removal goes first: the user has just seen the list it
+/// changes, and an install could change that list before it ran.
 fn start_queued(app: &mut App, ctx: &egui::Context) {
-    if app.queued.is_empty() || matches!(app.job, Job::Working { .. }) {
+    if job::is_busy(&app.job) {
+        return;
+    }
+    if let Some(removal) = app.queued_removal.take() {
+        app.job = job::start_removal(removal, ctx.clone());
+        return;
+    }
+    if app.queued.is_empty() {
         return;
     }
     let sources = std::mem::take(&mut app.queued);
     let Some(target) = app.target.as_ref() else {
-        let rows = sources.iter().map(|source| no_target_row(source)).collect();
-        prepend(&mut app.rows, rows);
+        let rows = sources
+            .iter()
+            .map(|source| results::no_target_row(source))
+            .collect();
+        results::prepend(&mut app.rows, rows);
         return;
     };
-    app.job = Job::Working {
-        items: sources.len(),
-        results: start_install(sources, target.addons_dir(), ctx.clone()),
-    };
-}
-
-/// Moves a finished job's rows into the list.
-///
-/// Reports whether a job ended, so the caller can refresh what it says about
-/// the game folder.
-fn finish_job(job: &mut Job, rows: &mut Vec<Row>) -> bool {
-    let Job::Working { results, .. } = job else {
-        return false;
-    };
-    match results.try_recv() {
-        Ok(finished) => {
-            prepend(rows, finished);
-            *job = Job::Idle;
-            true
-        }
-        Err(TryRecvError::Empty) => false,
-        // The thread ended without reporting, which takes a panic. Nothing
-        // more will arrive, so say so rather than waiting for ever.
-        Err(TryRecvError::Disconnected) => {
-            prepend(rows, vec![unexpected_stop_row()]);
-            *job = Job::Idle;
-            true
-        }
-    }
-}
-
-fn prepend(rows: &mut Vec<Row>, newest: Vec<Row>) {
-    rows.splice(0..0, newest);
-}
-
-/// Installs sources on another thread so that the window keeps drawing.
-fn start_install(
-    sources: Vec<PathBuf>,
-    addons_dir: PathBuf,
-    ctx: egui::Context,
-) -> Receiver<Vec<Row>> {
-    let (sender, results) = mpsc::channel();
-    thread::spawn(move || {
-        let rows: Vec<Row> = sources
-            .iter()
-            .flat_map(|source| install_source(source, &addons_dir))
-            .collect();
-        // A closed channel means the window has gone, which is not a problem.
-        let _ = sender.send(rows);
-        ctx.request_repaint();
-    });
-    results
-}
-
-/// Installs one source, as a row per addon or one row saying why the source
-/// could not be read at all.
-fn install_source(source: &Path, addons_dir: &Path) -> Vec<Row> {
-    match crate::install_source(source, addons_dir) {
-        Ok(outcomes) => outcomes.iter().map(outcome_row).collect(),
-        Err(error) => vec![Row {
-            status: "failed",
-            addon: crate::fs_util::file_name_lossy(source),
-            detail: error.to_string(),
-            failed: true,
-        }],
-    }
-}
-
-fn outcome_row(outcome: &Outcome) -> Row {
-    match &outcome.result {
-        Ok(installed) => Row {
-            status: if installed.replaced {
-                "updated"
-            } else {
-                "installed"
-            },
-            addon: outcome.addon.clone(),
-            detail: outcome.toc.version.clone().unwrap_or_default(),
-            failed: false,
-        },
-        Err(error) => Row {
-            status: "failed",
-            addon: outcome.addon.clone(),
-            detail: error.to_string(),
-            failed: true,
-        },
-    }
-}
-
-fn no_target_row(source: &Path) -> Row {
-    Row {
-        status: "failed",
-        addon: crate::fs_util::file_name_lossy(source),
-        detail: "choose a World of Warcraft folder first".to_string(),
-        failed: true,
-    }
-}
-
-fn unexpected_stop_row() -> Row {
-    Row {
-        status: "failed",
-        addon: "Install".to_string(),
-        detail: "the install stopped unexpectedly".to_string(),
-        failed: true,
-    }
-}
-
-/// The paths dropped onto the window this frame.
-fn dropped_sources(ctx: &egui::Context) -> Vec<Action> {
-    let paths: Vec<PathBuf> = ctx.input(|input| {
-        input
-            .raw
-            .dropped_files
-            .iter()
-            .map(|file| file.path().to_path_buf())
-            .collect()
-    });
-    if paths.is_empty() {
-        Vec::new()
-    } else {
-        vec![Action::AddSources(paths)]
-    }
-}
-
-/// How many files are being dragged over the window right now.
-fn hovering_count(ctx: &egui::Context) -> usize {
-    ctx.input(|input| input.raw.hovered_files.len())
+    app.job = job::start_install(sources, target.addons_dir(), ctx.clone());
 }
 
 /// Top panel: which game folder and version addons go to.
@@ -480,8 +517,10 @@ fn target_panel(ui: &mut egui::Ui, app: &App) -> Vec<Action> {
             ui.horizontal(|ui| {
                 ui.label("Game version");
                 actions.extend(flavor_picker(ui, app.target.as_ref()));
-                if let Some(installed) = app.installed {
-                    ui.label(egui::RichText::new(describe_count(installed)).weak());
+                if app.target.is_some()
+                    && let Ok(addons) = &app.listing
+                {
+                    ui.label(egui::RichText::new(describe_count(addons.len())).weak());
                 }
             });
             if let Some(notice) = &app.notice {
@@ -496,11 +535,7 @@ fn target_panel(ui: &mut egui::Ui, app: &App) -> Vec<Action> {
 }
 
 fn describe_count(installed: usize) -> String {
-    if installed == 1 {
-        "1 addon installed".to_string()
-    } else {
-        format!("{installed} addons installed")
-    }
+    format!("{} installed", describe_addons(installed))
 }
 
 fn install_picker(
@@ -551,187 +586,63 @@ fn flavor_picker(ui: &mut egui::Ui, target: Option<&Target>) -> Vec<Action> {
     actions
 }
 
-/// Bottom panel: what the last installs did. Hidden until there is something
-/// to say.
-fn results_panel(ui: &mut egui::Ui, rows: &[Row]) -> Vec<Action> {
-    if rows.is_empty() {
-        return Vec::new();
-    }
-    egui::Panel::bottom("results")
-        .resizable(true)
-        .default_size(210.0)
-        .show(ui, |ui| {
-            let mut actions = Vec::new();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(summarise(rows)).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear").clicked() {
-                        actions.push(Action::ClearResults);
-                    }
-                });
-            });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| result_rows(ui, rows));
-            actions
-        })
-        .inner
-}
-
-fn result_rows(ui: &mut egui::Ui, rows: &[Row]) {
-    egui::Grid::new("results")
-        .num_columns(3)
-        .striped(true)
-        .spacing([16.0, 6.0])
-        .show(ui, |ui| {
-            for row in rows {
-                let colour = status_colour(ui.visuals(), row.failed);
-                ui.colored_label(colour, row.status);
-                ui.label(egui::RichText::new(row.addon.as_str()).strong());
-                ui.label(row.detail.as_str());
-                ui.end_row();
-            }
-        });
-}
-
-fn status_colour(visuals: &egui::Visuals, failed: bool) -> egui::Color32 {
-    if failed {
-        visuals.error_fg_color
-    } else if visuals.dark_mode {
-        egui::Color32::from_rgb(0x7a, 0xd1, 0x8c)
+/// The main area: the tabs, and the one that is open.
+///
+/// While files are dragged over the window it shows the drop zone whichever
+/// tab is open, since that is where they will go.
+fn main_panel(ui: &mut egui::Ui, app: &App) -> Vec<Action> {
+    let hovering = drop_zone::hovering_count(ui.ctx());
+    let shown = if hovering > 0 {
+        View::Install
     } else {
-        egui::Color32::from_rgb(0x1c, 0x7a, 0x3e)
-    }
-}
-
-fn summarise(rows: &[Row]) -> String {
-    let failed = rows.iter().filter(|row| row.failed).count();
-    let done = rows.len() - failed;
-    if failed == 0 {
-        format!("{done} installed")
-    } else {
-        format!("{done} installed, {failed} failed")
-    }
-}
-
-/// The rest of the window: the area files are dropped onto.
-fn drop_panel(ui: &mut egui::Ui, app: &App) -> Vec<Action> {
-    let hovering = hovering_count(ui.ctx());
-    let (heading, hint) = zone_text(&app.job, app.target.as_ref(), hovering, app.drops_arrive);
-    let busy = matches!(app.job, Job::Working { .. });
+        app.view
+    };
     egui::CentralPanel::default()
         .show(ui, |ui| {
-            let mut actions = Vec::new();
-            drop_zone(ui, hovering > 0, |ui| {
-                ui.add_space(ui.available_height() * 0.25);
-                ui.label(egui::RichText::new(heading).size(20.0).strong());
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(hint).weak());
-                ui.add_space(20.0);
-                if busy {
-                    ui.spinner();
-                } else {
-                    actions.extend(browse_buttons(ui));
-                }
-            });
+            let mut actions = tabs(ui, shown);
+            ui.add_space(8.0);
+            match shown {
+                View::Install => actions.extend(drop_zone::show(
+                    ui,
+                    &app.job,
+                    app.target.as_ref(),
+                    hovering,
+                    app.drops_arrive,
+                )),
+                View::Addons => actions.extend(addon_list::show(
+                    ui,
+                    &app.listing,
+                    &app.list,
+                    app.target.as_ref(),
+                    &app.job,
+                )),
+            }
             actions
         })
         .inner
 }
 
-/// Draws the drop target, highlighted while files are dragged over it.
-fn drop_zone(ui: &mut egui::Ui, active: bool, contents: impl FnOnce(&mut egui::Ui)) {
-    let visuals = ui.visuals();
-    let (fill, stroke) = if active {
-        (
-            visuals.selection.bg_fill.linear_multiply(0.35),
-            egui::Stroke::new(2.0, visuals.selection.stroke.color),
-        )
-    } else {
-        (
-            visuals.faint_bg_color,
-            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
-        )
-    };
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(12)
-        .inner_margin(16)
-        .show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
-            ui.vertical_centered(|ui| contents(ui));
-        });
-}
-
-/// The way in for users who would rather not drag anything.
-fn browse_buttons(ui: &mut egui::Ui) -> Vec<Action> {
+fn tabs(ui: &mut egui::Ui, shown: View) -> Vec<Action> {
     let mut actions = Vec::new();
-    ui.allocate_ui_with_layout(
-        egui::vec2(330.0, 28.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            if ui.button("Choose zip files...").clicked() {
-                let chosen = pick_archives();
-                if !chosen.is_empty() {
-                    actions.push(Action::AddSources(chosen));
-                }
+    ui.horizontal(|ui| {
+        for (view, label) in [
+            (View::Install, "Install"),
+            (View::Addons, "Installed addons"),
+        ] {
+            if ui.selectable_label(shown == view, label).clicked() && shown != view {
+                actions.push(Action::ShowView(view));
             }
-            if ui.button("Choose an addon folder...").clicked()
-                && let Some(chosen) = pick_folder("Choose an addon folder")
-            {
-                actions.push(Action::AddSources(vec![chosen]));
-            }
-        },
-    );
+        }
+    });
     actions
 }
 
-/// The heading and the hint shown in the drop zone, which together say what
-/// will happen if something is dropped.
-///
-/// `drops_arrive` is false on a backend that never reports a drop, and there
-/// the zone stops asking to be dropped on and names the buttons instead.
-fn zone_text(
-    job: &Job,
-    target: Option<&Target>,
-    hovering: usize,
-    drops_arrive: bool,
-) -> (String, String) {
-    if let Job::Working { items, .. } = job {
-        return (
-            format!("Installing {}...", describe_items(*items)),
-            "The window stays usable; anything else dropped will follow.".to_string(),
-        );
+fn describe_addons(count: usize) -> String {
+    if count == 1 {
+        "1 addon".to_string()
+    } else {
+        format!("{count} addons")
     }
-    let Some(target) = target else {
-        return (
-            "No World of Warcraft folder found".to_string(),
-            "Use Choose... above to point at your game folder.".to_string(),
-        );
-    };
-    if hovering > 0 {
-        return (
-            format!("Install {}", describe_items(hovering)),
-            format!("Release to install into {}.", target.flavor.label()),
-        );
-    }
-    let destination = display_path(&target.addons_dir());
-    if !drops_arrive {
-        return (
-            "Choose addon folders or zip files".to_string(),
-            format!(
-                "This window cannot take drops on Wayland. The buttons below \
-                 install into {destination}"
-            ),
-        );
-    }
-    (
-        "Drop addon folders or zip files here".to_string(),
-        format!("They go into {destination}"),
-    )
 }
 
 fn describe_items(count: usize) -> String {
@@ -756,14 +667,6 @@ fn pick_folder(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new().set_title(title).pick_folder()
 }
 
-fn pick_archives() -> Vec<PathBuf> {
-    rfd::FileDialog::new()
-        .set_title("Choose addon zip files")
-        .add_filter("Zip archive", &["zip"])
-        .pick_files()
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -771,7 +674,7 @@ mod tests {
     use super::*;
 
     /// Builds an install directory holding the given game versions.
-    fn fake_install(root: &Path, flavors: &[&str]) -> WowInstall {
+    pub(super) fn fake_install(root: &Path, flavors: &[&str]) -> WowInstall {
         for flavor in flavors {
             fs::create_dir_all(root.join(flavor).join("Interface").join("AddOns")).unwrap();
         }
@@ -842,79 +745,12 @@ mod tests {
         assert!(initial_target(&[], None, &Settings::default()).is_none());
     }
 
-    fn row(status: &'static str, failed: bool) -> Row {
-        Row {
-            status,
-            addon: "MyAddon".to_string(),
-            detail: String::new(),
-            failed,
-        }
-    }
-
-    #[test]
-    fn summarises_what_a_run_did() {
-        assert_eq!(summarise(&[row("installed", false)]), "1 installed");
-        assert_eq!(
-            summarise(&[row("updated", false), row("failed", true)]),
-            "1 installed, 1 failed"
-        );
-    }
-
-    #[test]
-    fn newest_results_are_listed_first() {
-        let mut rows = vec![row("installed", false)];
-
-        prepend(&mut rows, vec![row("failed", true)]);
-
-        assert_eq!(rows[0].status, "failed");
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn the_drop_zone_says_there_is_nowhere_to_install_to() {
-        let (heading, hint) = zone_text(&Job::Idle, None, 0, true);
-
-        assert_eq!(heading, "No World of Warcraft folder found");
-        assert!(hint.contains("Choose"));
-    }
-
-    #[test]
-    fn the_drop_zone_counts_what_is_being_dragged() {
-        let (heading, _) = zone_text(&Job::Idle, None, 3, true);
-
-        // With nowhere to install to, the count is not the point.
-        assert_eq!(heading, "No World of Warcraft folder found");
-    }
-
     /// Builds a target to install into, so that the drop zone has somewhere to
     /// name.
-    fn fake_target(root: &Path) -> Target {
+    pub(super) fn fake_target(root: &Path) -> Target {
         let install = fake_install(root, &["_retail_"]);
         let flavor = first_flavor(&install);
         Target { install, flavor }
-    }
-
-    #[test]
-    fn the_drop_zone_invites_a_drop_where_drops_arrive() {
-        let root = tempfile::tempdir().unwrap();
-        let target = fake_target(root.path());
-
-        let (heading, hint) = zone_text(&Job::Idle, Some(&target), 0, true);
-
-        assert_eq!(heading, "Drop addon folders or zip files here");
-        assert!(hint.contains("AddOns"));
-    }
-
-    #[test]
-    fn the_drop_zone_sends_the_user_to_the_buttons_where_drops_never_arrive() {
-        let root = tempfile::tempdir().unwrap();
-        let target = fake_target(root.path());
-
-        let (heading, hint) = zone_text(&Job::Idle, Some(&target), 0, false);
-
-        assert_eq!(heading, "Choose addon folders or zip files");
-        assert!(hint.contains("The buttons below install into"));
-        assert!(hint.contains("AddOns"));
     }
 
     #[test]
@@ -926,14 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn a_source_dropped_with_no_target_says_what_is_missing() {
-        let row = no_target_row(Path::new("/tmp/MyAddon.zip"));
-
-        assert_eq!(row.addon, "MyAddon.zip");
-        assert!(row.failed);
-    }
-
-    #[test]
     fn long_paths_are_shortened_to_the_home_folder() {
         let Some(home) = std::env::home_dir() else {
             return;
@@ -941,5 +769,192 @@ mod tests {
 
         assert_eq!(display_path(&home.join("Games/wow")), "~/Games/wow");
         assert_eq!(display_path(Path::new("/opt/wow")), "/opt/wow");
+    }
+
+    /// Opens the window's state on a game folder holding these retail
+    /// addons, each with the toc header given. The folder is named outright,
+    /// so the usual search of the home folder never runs.
+    fn app_with(root: &Path, flavors: &[&str], addons: &[(&str, &str)]) -> App {
+        let install = fake_install(root, flavors);
+        let addons_dir = install.addons_dir(&first_flavor(&install));
+        for (name, toc) in addons {
+            fs::create_dir_all(addons_dir.join(name)).unwrap();
+            fs::write(addons_dir.join(name).join(format!("{name}.toc")), toc).unwrap();
+        }
+        App::new(Some(root), Some("retail"), Vec::new(), true, None)
+    }
+
+    fn names(addons: &[InstalledAddon]) -> Vec<&str> {
+        addons.iter().map(InstalledAddon::name).collect()
+    }
+
+    /// Ticks a retail addon, as clicking its tick box does.
+    fn tick_addon(app: &mut App, root: &Path, name: &str) {
+        let addon = root.join("_retail_/Interface/AddOns").join(name);
+        apply(
+            Action::Tick {
+                addon,
+                ticked: true,
+            },
+            app,
+        );
+    }
+
+    #[test]
+    fn the_window_lists_what_is_installed_when_it_opens() {
+        let root = tempfile::tempdir().unwrap();
+
+        let app = app_with(
+            root.path(),
+            &["_retail_"],
+            &[("Details", ""), ("WeakAuras", "")],
+        );
+
+        assert_eq!(
+            names(app.listing.as_ref().unwrap()),
+            vec!["Details", "WeakAuras"]
+        );
+    }
+
+    #[test]
+    fn confirming_queues_the_ticked_addons_and_those_that_need_them() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app_with(
+            root.path(),
+            &["_retail_"],
+            &[
+                ("Details", ""),
+                ("WeakAuras", ""),
+                ("WeakAurasOptions", "## Dependencies: WeakAuras\n"),
+            ],
+        );
+
+        tick_addon(&mut app, root.path(), "WeakAuras");
+        apply(Action::AskToRemove, &mut app);
+        let asked = app.list.confirming.clone().unwrap();
+        apply(Action::ConfirmRemoval, &mut app);
+
+        assert_eq!(names(&asked.dependents), vec!["WeakAurasOptions"]);
+        assert!(app.list.confirming.is_none());
+        assert!(app.list.ticked.is_empty());
+        let removal = app.queued_removal.as_ref().unwrap();
+        assert_eq!(
+            names(&removal.addons),
+            vec!["WeakAuras", "WeakAurasOptions"]
+        );
+        assert!(
+            root.path()
+                .join("_retail_/Interface/AddOns/WeakAuras")
+                .exists(),
+            "nothing is removed until the queue starts the job"
+        );
+    }
+
+    #[test]
+    fn cancelling_removes_nothing_and_keeps_the_ticks() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app_with(root.path(), &["_retail_"], &[("WeakAuras", "")]);
+
+        tick_addon(&mut app, root.path(), "WeakAuras");
+        apply(Action::AskToRemove, &mut app);
+        apply(Action::CancelRemoval, &mut app);
+
+        assert!(app.list.confirming.is_none());
+        assert!(app.queued_removal.is_none());
+        let ticked = root.path().join("_retail_/Interface/AddOns/WeakAuras");
+        assert!(app.list.ticked.contains(&ticked));
+    }
+
+    #[test]
+    fn ticks_belong_to_the_game_version_they_were_made_in() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app_with(
+            root.path(),
+            &["_retail_", "_classic_era_"],
+            &[("WeakAuras", "")],
+        );
+        let era = Flavor::from_dir_name("_classic_era_").unwrap();
+
+        tick_addon(&mut app, root.path(), "WeakAuras");
+        apply(Action::SelectFlavor(era), &mut app);
+
+        assert!(app.list.ticked.is_empty());
+        assert!(app.listing.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn opening_the_list_shows_changes_made_behind_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app_with(root.path(), &["_retail_"], &[("WeakAuras", "")]);
+        tick_addon(&mut app, root.path(), "WeakAuras");
+        fs::remove_dir_all(root.path().join("_retail_/Interface/AddOns/WeakAuras")).unwrap();
+
+        apply(Action::ShowView(View::Addons), &mut app);
+
+        assert!(app.listing.as_ref().unwrap().is_empty());
+        assert!(app.list.ticked.is_empty());
+    }
+
+    #[test]
+    fn a_wow_dir_in_no_game_version_it_can_see_is_named_in_a_notice() {
+        let root = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_"]);
+        let unseen = root.path().join("_classic_era_");
+        fs::create_dir_all(&unseen).unwrap();
+
+        let app = App::new(Some(&unseen), None, Vec::new(), true, None);
+
+        assert!(app.target.unwrap().flavor.is_retail());
+        assert!(app.notice.unwrap().contains("Check the game version above"));
+    }
+
+    #[test]
+    fn a_wow_dir_inside_a_game_version_opens_the_window_on_it() {
+        let root = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_", "_classic_era_"]);
+        let era = root.path().join("_classic_era_/Interface/AddOns");
+
+        let app = App::new(Some(&era), None, Vec::new(), true, None);
+
+        assert_eq!(app.target.unwrap().flavor.dir_name(), "_classic_era_");
+    }
+
+    #[test]
+    fn a_removal_waits_for_a_running_job_then_goes_before_queued_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = app_with(root.path(), &["_retail_"], &[("WeakAuras", "")]);
+        let ctx = egui::Context::default();
+        tick_addon(&mut app, root.path(), "WeakAuras");
+        apply(Action::AskToRemove, &mut app);
+        // Files dropped while the dialog is open start an install, and more
+        // dropped after that wait for it.
+        let (install_ends, results) = std::sync::mpsc::channel();
+        app.job = Job::Working {
+            task: job::Task::Install { items: 1 },
+            results,
+        };
+        app.queued.push(root.path().join("Dropped.zip"));
+
+        apply(Action::ConfirmRemoval, &mut app);
+        start_queued(&mut app, &ctx);
+
+        assert!(app.list.confirming.is_some(), "the dialog stays open");
+        assert!(app.queued_removal.is_none());
+        assert_eq!(app.queued.len(), 1);
+
+        install_ends.send(Vec::new()).unwrap();
+        assert!(job::finish(&mut app.job, &mut app.rows));
+        apply(Action::ConfirmRemoval, &mut app);
+        start_queued(&mut app, &ctx);
+
+        assert!(app.list.confirming.is_none());
+        assert_eq!(app.queued.len(), 1, "the drop waits for the removal");
+        let Job::Working { task, results } = std::mem::replace(&mut app.job, Job::Idle) else {
+            panic!("the removal did not start");
+        };
+        assert_eq!(task, job::Task::Remove { addons: 1 });
+        results.recv().unwrap();
+        let removed = root.path().join("_retail_/Interface/AddOns/WeakAuras");
+        assert!(!removed.exists());
     }
 }

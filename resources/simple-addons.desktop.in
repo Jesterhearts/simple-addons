@@ -2,12 +2,12 @@
 Type=Application
 Version=1.0
 Name=Simple Addons
-GenericName=Addon Installer
-Comment=Install World of Warcraft addons from a folder or a zip file
+GenericName=Addon Manager
+Comment=Install and remove World of Warcraft addons
 Exec=@BINARY@ --gui %F
 Icon=simple-addons
 Terminal=false
 Categories=Utility;
-Keywords=warcraft;wow;addon;install;
+Keywords=warcraft;wow;addon;install;remove;
 StartupWMClass=simple-addons
 StartupNotify=true

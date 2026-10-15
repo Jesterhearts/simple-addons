@@ -114,8 +114,11 @@ impl WowInstall {
 }
 
 /// Decides whether one directory is a World of Warcraft directory.
+///
+/// A game version folder may be a link, as when one version is kept on
+/// another disk, so links to folders count.
 pub fn read_install(root: &Path) -> Option<WowInstall> {
-    let mut flavors: Vec<Flavor> = fs_util::dirs_in(fs_util::list_dir(root).ok()?)
+    let mut flavors: Vec<Flavor> = fs_util::folders_in(fs_util::list_dir(root).ok()?)
         .iter()
         .filter_map(|dir| flavor_at(dir))
         .collect();
@@ -175,8 +178,61 @@ pub fn discover() -> Vec<WowInstall> {
 pub fn open(path: &Path) -> Result<WowInstall> {
     walk_up(path, 3)
         .iter()
-        .find_map(|root| read_install(root))
+        .find_map(|dir| install_holding(dir).or_else(|| read_install(dir)))
         .ok_or_else(|| Error::NotAnInstall(path.to_path_buf()))
+}
+
+/// The install a game version folder belongs to, when `dir` is one.
+///
+/// A game version folder can itself hold a folder shaped like one, such as
+/// a backup made by hand, which would make it look like an install of its
+/// own. The install it belongs to is the one meant.
+fn install_holding(dir: &Path) -> Option<WowInstall> {
+    let install = read_install(dir.parent()?)?;
+    let name = dir.file_name()?.to_str()?;
+    let holds_dir = install
+        .flavors()
+        .iter()
+        .any(|flavor| flavor.dir_name() == name);
+    holds_dir.then_some(install)
+}
+
+/// The game version a path lies in, such as Classic Era for
+/// `<install>/_classic_era_/Interface/AddOns`. `None` for the install root
+/// itself, and for a path outside the install, since neither names one.
+///
+/// [`open`] accepts paths like these, and the path says which game version
+/// was meant as plainly as the install it is in does. A path inside the
+/// install but in no game version found there names something this program
+/// cannot see, so that is an error rather than no answer: treating it as no
+/// answer would quietly pick another game version.
+pub fn flavor_containing<'a>(install: &'a WowInstall, path: &Path) -> Result<Option<&'a Flavor>> {
+    let Ok(relative) = path.strip_prefix(install.root()) else {
+        return Ok(None);
+    };
+    let Some(first) = relative.components().next() else {
+        return Ok(None);
+    };
+    let first = first.as_os_str().to_string_lossy();
+    let exact = install
+        .flavors()
+        .iter()
+        .find(|flavor| flavor.dir_name() == first);
+    // A filesystem that ignores case lets a path spell the folder its own way.
+    let ignoring_case = || {
+        install
+            .flavors()
+            .iter()
+            .find(|flavor| flavor.dir_name().eq_ignore_ascii_case(&first))
+    };
+    match exact.or_else(ignoring_case) {
+        Some(flavor) => Ok(Some(flavor)),
+        None => Err(Error::NotInGameVersion {
+            path: path.to_path_buf(),
+            install: install.root().to_path_buf(),
+            available: flavor_list(install),
+        }),
+    }
 }
 
 /// Picks the game version to install into.
@@ -390,12 +446,102 @@ mod tests {
     }
 
     #[test]
+    fn a_game_version_holding_a_backup_shaped_like_one_still_opens_its_install() {
+        let root = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_", "_classic_era_"]);
+        let era = root.path().join("_classic_era_");
+        fake_install(&era, &["_backup_"]);
+
+        for start in [
+            era.clone(),
+            era.join("Interface"),
+            era.join("Interface/AddOns"),
+        ] {
+            let install = open(&start).unwrap();
+            assert_eq!(install.root(), root.path(), "from {start:?}");
+            let flavor = flavor_containing(&install, &start).unwrap().unwrap();
+            assert_eq!(flavor.dir_name(), "_classic_era_");
+        }
+    }
+
+    #[test]
     fn opening_somewhere_else_reports_the_path_given() {
         let root = tempfile::tempdir().unwrap();
 
         let error = open(root.path()).unwrap_err();
 
         assert!(matches!(error, Error::NotAnInstall(path) if path == root.path()));
+    }
+
+    #[test]
+    fn a_path_inside_a_game_version_names_that_game_version() {
+        let root = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_", "_classic_era_"]);
+        let era = root.path().join("_classic_era_");
+
+        for start in [
+            era.clone(),
+            era.join("Interface"),
+            era.join("Interface/AddOns"),
+        ] {
+            let install = open(&start).unwrap();
+            let flavor = flavor_containing(&install, &start).unwrap().unwrap();
+            assert_eq!(flavor.dir_name(), "_classic_era_", "from {start:?}");
+        }
+        let install = open(root.path()).unwrap();
+        assert_eq!(flavor_containing(&install, root.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_path_in_no_game_version_found_there_is_refused_rather_than_guessed() {
+        let root = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_"]);
+        let unknown = root.path().join("_classic_era_/Interface/AddOns");
+        fs::create_dir_all(&unknown).unwrap();
+        fs::remove_dir_all(root.path().join("_classic_era_/Interface")).unwrap();
+        fs::create_dir_all(root.path().join("Data")).unwrap();
+        let install = open(root.path()).unwrap();
+
+        for path in [root.path().join("_classic_era_"), root.path().join("Data")] {
+            let error = flavor_containing(&install, &path).unwrap_err();
+            assert!(
+                matches!(error, Error::NotInGameVersion { .. }),
+                "for {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_game_version_folder_may_be_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_"]);
+        fake_install(elsewhere.path(), &["_classic_era_"]);
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("_classic_era_"),
+            root.path().join("_classic_era_"),
+        )
+        .unwrap();
+        let addons = root.path().join("_classic_era_/Interface/AddOns");
+
+        let install = open(&addons).unwrap();
+
+        assert_eq!(install.root(), root.path());
+        let flavor = flavor_containing(&install, &addons).unwrap().unwrap();
+        assert_eq!(flavor.dir_name(), "_classic_era_");
+    }
+
+    #[test]
+    fn a_game_version_folder_spelt_in_other_capitals_is_still_found() {
+        let root = tempfile::tempdir().unwrap();
+        fake_install(root.path(), &["_retail_", "_classic_era_"]);
+        let install = open(root.path()).unwrap();
+
+        let flavor = flavor_containing(&install, &root.path().join("_Classic_Era_/Interface"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(flavor.dir_name(), "_classic_era_");
     }
 
     #[test]

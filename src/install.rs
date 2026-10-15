@@ -5,16 +5,18 @@
 //! so the game never finds a half written addon where a working one used to
 //! be, however the installer is interrupted.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fs_util;
-use crate::package::{AddonSource, Toc};
+use crate::package::{AddonName, AddonSource, Toc};
+use crate::staging::{self, LeftBehind, Staging};
 
 /// What installing one addon will do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddonPlan {
-    pub name: String,
+    pub name: AddonName,
     pub source: PathBuf,
     pub destination: PathBuf,
     /// True when an addon of this name is already installed and will be
@@ -44,14 +46,10 @@ pub struct Installed {
     pub destination: PathBuf,
     /// True when this replaced an addon that was already installed.
     pub replaced: bool,
+    /// Files of the replaced copy that could not be deleted, and where they
+    /// were moved instead.
+    pub left_behind: Option<LeftBehind>,
 }
-
-/// The folder used to assemble addons before they are moved into place.
-///
-/// It sits beside `AddOns` rather than inside it, so that the game never
-/// scans it, and on the same filesystem, so that moving out of it is a
-/// rename rather than a copy.
-const STAGING_DIR: &str = ".simple-addons-staging";
 
 /// Works out what installing these addons would do.
 pub fn plan(addons_dir: &Path, addons: &[AddonSource]) -> Plan {
@@ -81,66 +79,108 @@ fn plan_addon(addons_dir: &Path, addon: &AddonSource) -> AddonPlan {
 /// is written. Once that is done, every addon is attempted and reports for
 /// itself.
 pub fn execute(plan: &Plan) -> Result<Vec<Outcome>> {
-    let staging = staging_dir(&plan.addons_dir);
     fs_util::create_dir_all(&plan.addons_dir)?;
-    // An earlier run may have been killed before it could tidy up.
-    fs_util::remove_tree(&staging)?;
-    fs_util::create_dir_all(&staging)?;
+    let staging = staging::prepare(&plan.addons_dir)?;
 
     let outcomes = plan
         .addons
         .iter()
         .map(|addon| Outcome {
-            addon: addon.name.clone(),
+            addon: addon.name.to_string(),
             toc: addon.toc.clone(),
             result: install_addon(&staging, addon),
         })
         .collect();
 
-    fs_util::remove_tree(&staging)?;
+    // Every addon has reported for itself by now, so tidying up must not
+    // turn into an error that would hide those reports.
+    staging::finish(staging);
     Ok(outcomes)
 }
 
-fn staging_dir(addons_dir: &Path) -> PathBuf {
-    match addons_dir.parent() {
-        Some(parent) => parent.join(STAGING_DIR),
-        None => addons_dir.join(STAGING_DIR),
-    }
-}
-
-fn install_addon(staging: &Path, plan: &AddonPlan) -> Result<Installed> {
-    let incoming = staging.join(&plan.name);
+fn install_addon(staging: &Staging, plan: &AddonPlan) -> Result<Installed> {
+    let incoming = staging.path().join(&plan.name);
     fs_util::remove_tree(&incoming)?;
     fs_util::copy_tree(&plan.source, &incoming)?;
 
     let replaced = plan.destination.exists();
-    if replaced {
-        swap_in(&incoming, &plan.destination, staging, &plan.name)?;
+    let left_behind = if replaced {
+        swap_in(&incoming, &plan.destination, staging, &plan.name)?
     } else {
         fs_util::rename(&incoming, &plan.destination)?;
-    }
+        None
+    };
 
     Ok(Installed {
         destination: plan.destination.clone(),
         replaced,
+        left_behind,
     })
 }
 
-/// Replaces an installed addon with the one just copied.
+/// Replaces an installed addon with the one just copied, and says where any
+/// files of the old one that could not be deleted are now.
 ///
 /// The old folder is moved aside rather than deleted, so that a failed swap
 /// can put it back instead of leaving the user with no addon at all.
-fn swap_in(incoming: &Path, destination: &Path, staging: &Path, name: &str) -> Result<()> {
-    let previous = staging.join(format!("{name}.previous"));
-    fs_util::remove_tree(&previous)?;
+fn swap_in(
+    incoming: &Path,
+    destination: &Path,
+    staging: &Staging,
+    name: &AddonName,
+) -> Result<Option<LeftBehind>> {
+    let previous = staging::old_copy(staging, name);
+    // Every run starts by putting back or setting aside each old copy, so
+    // one still here could be neither. Moving over it could lose the only
+    // copy of that addon.
+    if fs::symlink_metadata(&previous).is_ok() {
+        return Err(Error::OldCopyInTheWay(previous));
+    }
     fs_util::rename(destination, &previous)?;
     if let Err(error) = fs_util::rename(incoming, destination) {
         // Putting the old addon back matters more than the original failure,
-        // so a failure to restore is what gets reported.
-        fs_util::rename(&previous, destination)?;
+        // so a failure to restore is what gets reported. The old copy stays
+        // where nothing deletes it, and the next run puts it back if nothing
+        // has taken its place.
+        if let Err(restore) = fs_util::rename(&previous, destination) {
+            return Err(Error::NotRestored {
+                destination: destination.to_path_buf(),
+                kept: previous,
+                reason: staging::reason(restore),
+            });
+        }
         return Err(error);
     }
-    fs_util::remove_tree(&previous)
+    Ok(retire_old_copy(staging, &previous, incoming))
+}
+
+/// Deletes the old copy once the update is done, and says where any of it
+/// that could not be deleted is now.
+///
+/// It goes back through the staging folder first, to where the new copy was
+/// assembled, so that whatever of it cannot be deleted is never taken for an
+/// old copy to put back.
+fn retire_old_copy(staging: &Staging, previous: &Path, assembled_at: &Path) -> Option<LeftBehind> {
+    let doomed = match fs_util::rename(previous, assembled_at) {
+        Ok(()) => assembled_at,
+        Err(_) => previous,
+    };
+    staging::discard(staging, doomed).err()
+}
+
+/// What a report says after the name of an addon it installed: the version,
+/// and where any files of the copy it replaced that could not be deleted
+/// are now.
+pub fn describe_installed(toc: &Toc, installed: &Installed) -> String {
+    let mut parts = vec![toc.version.clone().unwrap_or_default()];
+    parts.extend(
+        installed
+            .left_behind
+            .as_ref()
+            .map(staging::describe_left_behind),
+    );
+    parts.retain(|part| !part.is_empty());
+    parts.join("; ")
 }
 
 #[cfg(test)]
@@ -148,6 +188,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::fs_util::test_support::{make_read_only, make_writable};
 
     /// Builds the `Interface/AddOns` folder of a game version.
     fn addons_dir(root: &Path) -> PathBuf {
@@ -166,7 +207,7 @@ mod tests {
         .unwrap();
         fs::write(path.join("Core.lua"), format!("-- {version}\n")).unwrap();
         AddonSource {
-            name: name.to_string(),
+            name: AddonName::new(name).unwrap(),
             path,
             toc: crate::package::toc::parse(&format!("## Version: {version}\n")),
         }
@@ -215,6 +256,82 @@ mod tests {
             !addons.join("MyAddon/Stale.lua").exists(),
             "files dropped by the new version should not survive"
         );
+    }
+
+    #[test]
+    fn an_old_copy_that_cannot_be_deleted_does_not_fail_the_update() {
+        let root = tempfile::tempdir().unwrap();
+        let addons = addons_dir(root.path());
+        execute(&plan(
+            &addons,
+            &[addon_source(root.path(), "MyAddon", "1.0")],
+        ))
+        .unwrap();
+        fs::create_dir_all(addons.join("MyAddon/ReadOnly")).unwrap();
+        fs::write(addons.join("MyAddon/ReadOnly/Old.lua"), "").unwrap();
+        if !make_read_only(&addons.join("MyAddon/ReadOnly")) {
+            return;
+        }
+
+        let outcomes = execute(&plan(
+            &addons,
+            &[addon_source(root.path(), "MyAddon", "2.0")],
+        ))
+        .unwrap();
+        let again = execute(&plan(
+            &addons,
+            &[addon_source(root.path(), "MyAddon", "3.0")],
+        ))
+        .unwrap();
+
+        let installed = outcomes[0].result.as_ref().unwrap();
+        let left = installed.left_behind.as_ref().unwrap();
+        assert!(left.path.join("ReadOnly/Old.lua").is_file());
+        assert!(
+            describe_installed(&outcomes[0].toc, installed)
+                .starts_with("2.0; some files could not")
+        );
+        assert!(again[0].result.is_ok(), "the next update is not blocked");
+        assert_eq!(
+            fs::read_to_string(addons.join("MyAddon/Core.lua")).unwrap(),
+            "-- 3.0\n"
+        );
+        make_writable(root.path());
+    }
+
+    #[test]
+    fn an_update_does_not_delete_an_old_copy_it_could_not_keep_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let addons = addons_dir(root.path());
+        execute(&plan(
+            &addons,
+            &[addon_source(root.path(), "MyAddon", "1.0")],
+        ))
+        .unwrap();
+        let interface = addons.parent().unwrap();
+        let old = interface.join(".simple-addons-old-copies/MyAddon");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("Only.lua"), "").unwrap();
+        fs::create_dir_all(interface.join(".simple-addons-staging")).unwrap();
+        // MyAddon is installed, so the old copy cannot go back, and with
+        // Interface read-only it cannot be set aside either.
+        if !make_read_only(interface) {
+            return;
+        }
+
+        let outcomes = execute(&plan(
+            &addons,
+            &[addon_source(root.path(), "MyAddon", "2.0")],
+        ))
+        .unwrap();
+
+        assert!(matches!(outcomes[0].result, Err(Error::OldCopyInTheWay(_))));
+        assert!(old.join("Only.lua").is_file());
+        assert_eq!(
+            fs::read_to_string(addons.join("MyAddon/Core.lua")).unwrap(),
+            "-- 1.0\n"
+        );
+        make_writable(root.path());
     }
 
     #[test]

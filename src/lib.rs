@@ -1,6 +1,7 @@
-//! Install World of Warcraft addons from a folder or a zip file.
+//! Install World of Warcraft addons from a folder or a zip file, and remove
+//! them again.
 //!
-//! The work is one pipeline:
+//! Installing is one pipeline:
 //!
 //! ```text
 //! folder or zip file
@@ -10,8 +11,18 @@
 //!   -> Interface/AddOns        (install::execute)
 //! ```
 //!
-//! Where the addons go is worked out separately, by [`discovery`], and the
-//! two meet in [`install_source`].
+//! Removing is a shorter one, which starts from what is already there:
+//!
+//! ```text
+//! Interface/AddOns
+//!   -> installed addons        (installed::list)
+//!   -> the ones to remove      (installed::find, installed::dependents)
+//!   -> removed                 (remove::execute)
+//! ```
+//!
+//! Where the addons go is worked out separately, by [`discovery`]. It meets
+//! the install pipeline in [`install_source`], and the front ends hand it to
+//! the removal pipeline themselves, since each chooses addons in its own way.
 
 pub mod cli;
 pub mod discovery;
@@ -19,7 +30,10 @@ pub mod error;
 pub mod fs_util;
 pub mod gui;
 pub mod install;
+pub mod installed;
 pub mod package;
+pub mod remove;
+pub mod staging;
 
 use std::path::Path;
 
@@ -52,8 +66,7 @@ pub fn install_source(source: &Path, addons_dir: &Path) -> Result<Vec<Outcome>> 
 /// Used to tell the user what is already there, so a count is not worth an
 /// error when the folder cannot be read.
 pub fn count_installed(addons_dir: &Path) -> Option<usize> {
-    let entries = fs_util::list_dir(addons_dir).ok()?;
-    Some(fs_util::dirs_in(entries).len())
+    installed::count(addons_dir).ok()
 }
 
 #[cfg(test)]
@@ -121,6 +134,21 @@ mod tests {
 
         assert_eq!(outcomes[0].addon, "MyAddon");
         assert!(addons.join("MyAddon/MyAddon.toc").is_file());
+    }
+
+    #[test]
+    fn a_toc_file_named_to_climb_out_of_addons_touches_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let addons = addons_dir(root.path());
+        fs::create_dir_all(addons.join("Kept")).unwrap();
+        fs::write(addons.join("Kept/Kept.toc"), "").unwrap();
+        let archive = root.path().join("evil.zip");
+        write_zip(&archive, &[("Evil/...toc", ""), ("Evil/Core.lua", "")]);
+
+        let result = install_source(&archive, &addons);
+
+        assert!(matches!(result, Err(Error::NoAddonFound(_))));
+        assert!(addons.join("Kept/Kept.toc").is_file());
     }
 
     #[test]

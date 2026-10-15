@@ -30,6 +30,19 @@ pub enum Error {
     #[error("{install} holds several game versions ({available}); pick one with --flavor")]
     AmbiguousGameVersion { install: PathBuf, available: String },
 
+    #[error("found several World of Warcraft directories ({found}); choose one with --wow-dir")]
+    SeveralInstallsFound { found: String },
+
+    #[error(
+        "{path} is inside {install} but not inside any game version found there \
+         ({available}); name the game version with --flavor"
+    )]
+    NotInGameVersion {
+        path: PathBuf,
+        install: PathBuf,
+        available: String,
+    },
+
     #[error("{0} does not exist")]
     MissingSource(PathBuf),
 
@@ -41,6 +54,41 @@ pub enum Error {
          an addon is a folder holding a .toc file named after it"
     )]
     NoAddonFound(PathBuf),
+
+    #[error("{addon} is not installed in {addons_dir}")]
+    NotInstalled { addon: String, addons_dir: PathBuf },
+
+    #[error(
+        "\"{requested}\" could mean any of {matches} in {addons_dir}; \
+         give the name with the same capital letters as the folder"
+    )]
+    AmbiguousAddon {
+        requested: String,
+        matches: String,
+        addons_dir: PathBuf,
+    },
+
+    #[error(
+        "{0} holds an old copy of an addon that could not be moved to safety; \
+         move it somewhere else, then try again"
+    )]
+    OldCopyInTheWay(PathBuf),
+
+    #[error(
+        "cannot put the old copy back in {destination} ({reason}); it is kept in {kept}, \
+         and the next run puts it back if nothing has taken its place"
+    )]
+    NotRestored {
+        destination: PathBuf,
+        kept: PathBuf,
+        reason: String,
+    },
+
+    #[error(
+        "another copy of simple-addons is installing or removing addons in {0}; \
+         try again when it has finished"
+    )]
+    Busy(PathBuf),
 
     #[error("{archive} holds an entry that would write outside the install: {entry}")]
     UnsafeArchiveEntry { archive: PathBuf, entry: String },

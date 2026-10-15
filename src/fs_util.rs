@@ -57,6 +57,25 @@ pub fn dirs_in(entries: Vec<Entry>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// True for a directory, and for a symlink that leads to one. The game
+/// follows links, so where it looks for folders a link to a folder is one.
+pub fn is_folder(entry: &Entry) -> bool {
+    match entry.kind {
+        EntryKind::Dir => true,
+        EntryKind::Symlink => entry.path.is_dir(),
+        EntryKind::File => false,
+    }
+}
+
+/// Keeps the folders of a listing, counting links to folders.
+pub fn folders_in(entries: Vec<Entry>) -> Vec<PathBuf> {
+    entries
+        .into_iter()
+        .filter(is_folder)
+        .map(|entry| entry.path)
+        .collect()
+}
+
 /// Keeps only the files of a listing. Symlinks count as files, because the
 /// steps that read files are happy to follow them.
 pub fn files_in(entries: Vec<Entry>) -> Vec<PathBuf> {
@@ -133,6 +152,39 @@ pub fn file_name_lossy(path: &Path) -> String {
 pub fn has_extension(path: &Path, wanted: &str) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case(wanted))
+}
+
+/// Helpers for tests that need something which cannot be deleted.
+#[cfg(test)]
+pub mod test_support {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// Makes a folder read-only, so that nothing in it can be deleted, and
+    /// says whether that worked. It does not work for root, whom the mode
+    /// does not bind, so a test that relies on it has to be skipped there.
+    pub fn make_read_only(dir: &Path) -> bool {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join(".probe");
+        if fs::write(&probe, "").is_ok() {
+            fs::remove_file(&probe).unwrap();
+            eprintln!("skipped: a read-only folder does not stop this user");
+            return false;
+        }
+        true
+    }
+
+    /// Makes every folder under `root` writable again, so that the test can
+    /// tidy up after itself.
+    pub fn make_writable(root: &Path) {
+        for entry in super::list_dir(root).unwrap() {
+            if entry.kind == super::EntryKind::Dir {
+                fs::set_permissions(&entry.path, fs::Permissions::from_mode(0o755)).unwrap();
+                make_writable(&entry.path);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
